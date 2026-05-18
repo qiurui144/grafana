@@ -1833,3 +1833,331 @@ func TestFolderDeletePermissionChecks(t *testing.T) {
 		require.NotEqual(t, folderName, capturedFolder)
 	})
 }
+
+// stubBlobSupport records whether PutResourceBlob was reached. PutBlob tests
+// use it to assert that the defense-in-depth gate either delegates to the blob
+// backend or short-circuits before it.
+type stubBlobSupport struct {
+	putReached bool
+}
+
+func (s *stubBlobSupport) SupportsSignedURLs() bool { return false }
+
+func (s *stubBlobSupport) PutResourceBlob(_ context.Context, _ *resourcepb.PutBlobRequest) (*resourcepb.PutBlobResponse, error) {
+	s.putReached = true
+	return &resourcepb.PutBlobResponse{Uid: "blob-uid"}, nil
+}
+
+func (s *stubBlobSupport) GetResourceBlob(_ context.Context, _ *resourcepb.ResourceKey, _ *utils.BlobInfo, _ bool) (*resourcepb.GetBlobResponse, error) {
+	return &resourcepb.GetBlobResponse{}, nil
+}
+
+func TestPutBlobPermissionChecks(t *testing.T) {
+	user := &identity.StaticRequester{
+		Type:      authlib.TypeUser,
+		Login:     "testuser",
+		UserID:    123,
+		UserUID:   "u123",
+		OrgRole:   identity.RoleEditor,
+		Namespace: "default",
+	}
+	ctxWithUser := authlib.WithAuthInfo(context.Background(), user)
+
+	const (
+		group     = "playlist.grafana.app"
+		resource  = "playlists"
+		namespace = "default"
+		name      = "test-resource"
+	)
+
+	key := &resourcepb.ResourceKey{
+		Group:     group,
+		Resource:  resource,
+		Namespace: namespace,
+		Name:      name,
+	}
+
+	value := []byte(`{"apiVersion":"playlist.grafana.app/v0alpha1","kind":"Playlist","metadata":{"name":"` + name + `","uid":"test-uid","namespace":"` + namespace + `"},"spec":{"title":"t","interval":"5m","items":[]}}`)
+
+	newServer := func(t *testing.T, ac authlib.AccessClient, blob BlobSupport) *server {
+		t.Helper()
+		db, err := badger.Open(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+
+		kvStore := NewBadgerKV(db)
+		store, err := NewKVStorageBackend(KVBackendOptions{KvStore: kvStore})
+		require.NoError(t, err)
+
+		srv, err := NewResourceServer(ResourceServerOptions{
+			Backend:      store,
+			AccessClient: ac,
+			Blob:         BlobConfig{Backend: blob},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Stop(stopCtx)
+		})
+		return srv
+	}
+
+	// createParentResource seeds the parent so that the ReadResource inside
+	// PutBlob returns successfully. The ACL is flipped to allow during creation,
+	// then the caller is free to switch ac.fn before calling PutBlob.
+	createParentResource := func(t *testing.T, srv *server, ac *callbackAccessClient) {
+		t.Helper()
+		ac.fn = func(_ authlib.CheckRequest, _ string) (authlib.CheckResponse, error) { return allow() }
+		rsp, err := srv.Create(ctxWithUser, &resourcepb.CreateRequest{Key: key, Value: value})
+		require.NoError(t, err)
+		require.Nil(t, rsp.Error)
+	}
+
+	t.Run("rejects when no user in context", func(t *testing.T) {
+		ac := &callbackAccessClient{fn: func(authlib.CheckRequest, string) (authlib.CheckResponse, error) { return allow() }}
+		blob := &stubBlobSupport{}
+		srv := newServer(t, ac, blob)
+
+		rsp, err := srv.PutBlob(context.Background(), &resourcepb.PutBlobRequest{Resource: key})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusUnauthorized), rsp.Error.Code)
+		require.False(t, blob.putReached, "must not delegate to blob backend without a user")
+	})
+
+	t.Run("returns 404 when parent resource does not exist", func(t *testing.T) {
+		ac := &callbackAccessClient{fn: func(authlib.CheckRequest, string) (authlib.CheckResponse, error) { return allow() }}
+		blob := &stubBlobSupport{}
+		srv := newServer(t, ac, blob)
+
+		// No createParentResource — the backend has nothing under key.
+		rsp, err := srv.PutBlob(ctxWithUser, &resourcepb.PutBlobRequest{Resource: key})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusNotFound), rsp.Error.Code)
+		require.False(t, blob.putReached, "must not delegate when parent resource is missing")
+	})
+
+	t.Run("rejects with 403 when access.Check denies update on parent", func(t *testing.T) {
+		ac := &callbackAccessClient{}
+		blob := &stubBlobSupport{}
+		srv := newServer(t, ac, blob)
+		createParentResource(t, srv, ac)
+
+		ac.fn = func(authlib.CheckRequest, string) (authlib.CheckResponse, error) { return deny() }
+
+		rsp, err := srv.PutBlob(ctxWithUser, &resourcepb.PutBlobRequest{Resource: key})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusForbidden), rsp.Error.Code)
+		require.False(t, blob.putReached, "must not delegate when caller lacks update on parent")
+	})
+
+	t.Run("surfaces access.Check error", func(t *testing.T) {
+		ac := &callbackAccessClient{}
+		blob := &stubBlobSupport{}
+		srv := newServer(t, ac, blob)
+		createParentResource(t, srv, ac)
+
+		ac.fn = func(authlib.CheckRequest, string) (authlib.CheckResponse, error) {
+			return authlib.CheckResponse{}, errors.New("authz backend unavailable")
+		}
+
+		rsp, err := srv.PutBlob(ctxWithUser, &resourcepb.PutBlobRequest{Resource: key})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.False(t, blob.putReached, "must not delegate when the access check errors out")
+	})
+
+	t.Run("delegates to blob backend when access.Check allows update on parent", func(t *testing.T) {
+		ac := &callbackAccessClient{}
+		blob := &stubBlobSupport{}
+		srv := newServer(t, ac, blob)
+		createParentResource(t, srv, ac)
+
+		var capturedReq authlib.CheckRequest
+		var capturedFolder string
+		ac.fn = func(req authlib.CheckRequest, folder string) (authlib.CheckResponse, error) {
+			capturedReq, capturedFolder = req, folder
+			return allow()
+		}
+
+		rsp, err := srv.PutBlob(ctxWithUser, &resourcepb.PutBlobRequest{Resource: key})
+		require.NoError(t, err)
+		require.Nil(t, rsp.Error)
+		require.True(t, blob.putReached, "must delegate to blob backend on allow")
+
+		// Authz must be asked about "update" on the parent's group/resource/name.
+		require.Equal(t, utils.VerbUpdate, capturedReq.Verb)
+		require.Equal(t, group, capturedReq.Group)
+		require.Equal(t, resource, capturedReq.Resource)
+		require.Equal(t, namespace, capturedReq.Namespace)
+		require.Equal(t, name, capturedReq.Name)
+		// Test resource has no folder annotation, so the folder passed to Check is empty.
+		require.Equal(t, "", capturedFolder)
+	})
+}
+
+func TestRequireUserNamespace(t *testing.T) {
+	t.Run("returns 401 when no user in context", func(t *testing.T) {
+		got := requireUserNamespace(context.Background(), "default")
+		require.NotNil(t, got)
+		require.Equal(t, int32(http.StatusUnauthorized), got.Code)
+	})
+
+	t.Run("allows matching namespace", func(t *testing.T) {
+		ctx := authlib.WithAuthInfo(context.Background(), &identity.StaticRequester{
+			Type:      authlib.TypeUser,
+			Namespace: "default",
+		})
+		require.Nil(t, requireUserNamespace(ctx, "default"))
+	})
+
+	t.Run("rejects cross-namespace request", func(t *testing.T) {
+		ctx := authlib.WithAuthInfo(context.Background(), &identity.StaticRequester{
+			Type:      authlib.TypeUser,
+			Namespace: "org-1",
+		})
+		got := requireUserNamespace(ctx, "org-2")
+		require.NotNil(t, got)
+		require.Equal(t, int32(http.StatusForbidden), got.Code)
+	})
+
+	t.Run("allows wildcard user into any namespace", func(t *testing.T) {
+		ctx := authlib.WithAuthInfo(context.Background(), &identity.StaticRequester{
+			Type:      authlib.TypeAccessPolicy,
+			Namespace: "*",
+		})
+		require.Nil(t, requireUserNamespace(ctx, "org-7"))
+	})
+
+	t.Run("rejects non-wildcard user on cluster-scoped request", func(t *testing.T) {
+		// Cluster-scoped requests have an empty namespace. authlib.NamespaceMatches
+		// only allows these for callers with the "*" namespace; any tenant-scoped
+		// user must be rejected.
+		ctx := authlib.WithAuthInfo(context.Background(), &identity.StaticRequester{
+			Type:      authlib.TypeUser,
+			Namespace: "default",
+		})
+		got := requireUserNamespace(ctx, "")
+		require.NotNil(t, got)
+		require.Equal(t, int32(http.StatusForbidden), got.Code)
+	})
+}
+
+// newNamespaceTestServer builds a *server with a real KV-backed storage and a
+// permissive access client. The four delegated-only RPCs (GetBlob,
+// ListManagedObjects, CountManagedObjects, RebuildIndexes) gate on namespace
+// first, so search/blob backends are intentionally left unconfigured: a
+// request that should be rejected must be rejected before either is consulted.
+func newNamespaceTestServer(t *testing.T) *server {
+	t.Helper()
+
+	db, err := badger.Open(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	kvStore := NewBadgerKV(db)
+	store, err := NewKVStorageBackend(KVBackendOptions{KvStore: kvStore})
+	require.NoError(t, err)
+
+	srv, err := NewResourceServer(ResourceServerOptions{
+		Backend:      store,
+		AccessClient: authlib.FixedAccessClient(true),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Stop(stopCtx)
+	})
+	return srv
+}
+
+func ctxAsUserInNamespace(ns string) context.Context {
+	return authlib.WithAuthInfo(context.Background(), &identity.StaticRequester{
+		Type:      authlib.TypeUser,
+		UserID:    1,
+		UserUID:   "u1",
+		Namespace: ns,
+	})
+}
+
+func TestDelegatedRPCs_RejectCrossNamespace(t *testing.T) {
+	srv := newNamespaceTestServer(t)
+	userCtx := ctxAsUserInNamespace("org-1")
+
+	t.Run("GetBlob", func(t *testing.T) {
+		rsp, err := srv.GetBlob(userCtx, &resourcepb.GetBlobRequest{
+			Resource: &resourcepb.ResourceKey{Namespace: "org-2", Group: "g", Resource: "r", Name: "n"},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusForbidden), rsp.Error.Code)
+	})
+
+	t.Run("ListManagedObjects", func(t *testing.T) {
+		rsp, err := srv.ListManagedObjects(userCtx, &resourcepb.ListManagedObjectsRequest{Namespace: "org-2"})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusForbidden), rsp.Error.Code)
+	})
+
+	t.Run("CountManagedObjects", func(t *testing.T) {
+		rsp, err := srv.CountManagedObjects(userCtx, &resourcepb.CountManagedObjectsRequest{Namespace: "org-2"})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusForbidden), rsp.Error.Code)
+	})
+
+	t.Run("RebuildIndexes", func(t *testing.T) {
+		rsp, err := srv.RebuildIndexes(userCtx, &resourcepb.RebuildIndexesRequest{Namespace: "org-2"})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusForbidden), rsp.Error.Code)
+	})
+}
+
+func TestDelegatedRPCs_RejectMissingUser(t *testing.T) {
+	srv := newNamespaceTestServer(t)
+	ctx := context.Background()
+
+	t.Run("GetBlob", func(t *testing.T) {
+		rsp, err := srv.GetBlob(ctx, &resourcepb.GetBlobRequest{
+			Resource: &resourcepb.ResourceKey{Namespace: "org-1", Group: "g", Resource: "r", Name: "n"},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusUnauthorized), rsp.Error.Code)
+	})
+
+	t.Run("ListManagedObjects", func(t *testing.T) {
+		rsp, err := srv.ListManagedObjects(ctx, &resourcepb.ListManagedObjectsRequest{Namespace: "org-1"})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusUnauthorized), rsp.Error.Code)
+	})
+
+	t.Run("CountManagedObjects", func(t *testing.T) {
+		rsp, err := srv.CountManagedObjects(ctx, &resourcepb.CountManagedObjectsRequest{Namespace: "org-1"})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusUnauthorized), rsp.Error.Code)
+	})
+
+	t.Run("RebuildIndexes", func(t *testing.T) {
+		rsp, err := srv.RebuildIndexes(ctx, &resourcepb.RebuildIndexesRequest{Namespace: "org-1"})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusUnauthorized), rsp.Error.Code)
+	})
+}
+
+func TestGetBlob_RejectsMissingResourceKey(t *testing.T) {
+	srv := newNamespaceTestServer(t)
+	rsp, err := srv.GetBlob(ctxAsUserInNamespace("org-1"), &resourcepb.GetBlobRequest{Uid: "blob-uid"})
+	require.NoError(t, err)
+	require.NotNil(t, rsp.Error)
+	require.Equal(t, int32(http.StatusBadRequest), rsp.Error.Code)
+}
