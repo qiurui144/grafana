@@ -1959,16 +1959,16 @@ func (s *server) IsHealthy(ctx context.Context, req *resourcepb.HealthCheckReque
 // for a resource that does not yet exist) or "update" (when attaching a blob
 // to an existing resource) on the parent.
 func (s *server) PutBlob(ctx context.Context, req *resourcepb.PutBlobRequest) (*resourcepb.PutBlobResponse, error) {
-	if s.blob == nil {
-		return &resourcepb.PutBlobResponse{Error: &resourcepb.ErrorResult{
-			Message: "blob store not configured",
-			Code:    http.StatusNotImplemented,
-		}}, nil
-	}
 	if req.Resource == nil {
 		return &resourcepb.PutBlobResponse{Error: &resourcepb.ErrorResult{
 			Message: "missing resource key",
 			Code:    http.StatusBadRequest,
+		}}, nil
+	}
+	if s.blob == nil {
+		return &resourcepb.PutBlobResponse{Error: &resourcepb.ErrorResult{
+			Message: "blob store not configured",
+			Code:    http.StatusNotImplemented,
 		}}, nil
 	}
 
