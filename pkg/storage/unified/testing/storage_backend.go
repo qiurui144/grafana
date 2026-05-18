@@ -21,6 +21,7 @@ import (
 	"github.com/grafana/authlib/authn"
 	"github.com/grafana/authlib/types"
 
+	"github.com/grafana/grafana/pkg/apimachinery/identity"
 	"github.com/grafana/grafana/pkg/apimachinery/utils"
 	"github.com/grafana/grafana/pkg/storage/unified/resource"
 	"github.com/grafana/grafana/pkg/storage/unified/resourcepb"
@@ -1176,11 +1177,17 @@ func runTestIntegrationBackendListHistoryErrorReporting(t *testing.T, backend re
 }
 
 func runTestIntegrationBlobSupport(t *testing.T, backend resource.StorageBackend, nsPrefix string) {
-	ctx := testutil.NewTestContext(t, time.Now().Add(5*time.Second))
 	server := newServer(t, backend)
 	store, ok := backend.(resource.BlobSupport)
 	require.True(t, ok)
 	ns := nsPrefix + "-ns1"
+	// The blob RPCs gate on user.GetNamespace() matching the request's
+	// namespace, so the test ctx needs an identity scoped to ns rather than
+	// the empty user that NewTestContext provides by default.
+	ctx := identity.WithServiceIdentityForSingleNamespaceContext(
+		testutil.NewTestContext(t, time.Now().Add(5*time.Second)),
+		ns,
+	)
 
 	t.Run("put and fetch blob", func(t *testing.T) {
 		key := &resourcepb.ResourceKey{

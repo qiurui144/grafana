@@ -1955,7 +1955,9 @@ func (s *server) IsHealthy(ctx context.Context, req *resourcepb.HealthCheckReque
 // PutBlob implements BlobStore.
 // NOTE: Internal RPC -- callers are responsible for authorizing the originating user request.
 // Do not route end-user traffic here directly.
-// PutBlob additionally verifies the caller has "update" on the parent resource.
+// PutBlob additionally verifies the caller has "create" (when staging a blob
+// for a resource that does not yet exist) or "update" (when attaching a blob
+// to an existing resource) on the parent.
 func (s *server) PutBlob(ctx context.Context, req *resourcepb.PutBlobRequest) (*resourcepb.PutBlobResponse, error) {
 	if s.blob == nil {
 		return &resourcepb.PutBlobResponse{Error: &resourcepb.ErrorResult{
@@ -1978,22 +1980,29 @@ func (s *server) PutBlob(ctx context.Context, req *resourcepb.PutBlobRequest) (*
 		}}, nil
 	}
 
-	// Load the parent resource so we can authorize against its folder.
-	parent := s.backend.ReadResource(ctx, &resourcepb.ReadRequest{Key: req.Resource})
-	if parent == nil || parent.Error != nil {
-		return &resourcepb.PutBlobResponse{Error: &resourcepb.ErrorResult{
-			Message: "parent resource not found",
-			Code:    http.StatusNotFound,
-		}}, nil
-	}
-
-	a, err := s.access.Check(ctx, user, claims.CheckRequest{
-		Verb:      utils.VerbUpdate,
+	// The proto contract allows staging a blob for a resource that does not
+	// yet exist ("the name may not yet exist"). When the parent is present we
+	// authorize "update" against its folder; when it is absent we authorize
+	// "create" instead. Any error other than not-found is surfaced so we never
+	// silently drop a blob over a transient backend failure.
+	check := claims.CheckRequest{
+		Verb:      utils.VerbCreate,
 		Group:     req.Resource.Group,
 		Resource:  req.Resource.Resource,
 		Namespace: req.Resource.Namespace,
-		Name:      req.Resource.Name,
-	}, parent.Folder)
+	}
+	folder := ""
+	parent := s.backend.ReadResource(ctx, &resourcepb.ReadRequest{Key: req.Resource})
+	switch {
+	case parent != nil && parent.Error == nil:
+		check.Verb = utils.VerbUpdate
+		check.Name = req.Resource.Name
+		folder = parent.Folder
+	case parent != nil && parent.Error != nil && parent.Error.Code != http.StatusNotFound:
+		return &resourcepb.PutBlobResponse{Error: parent.Error}, nil
+	}
+
+	a, err := s.access.Check(ctx, user, check, folder)
 	if err != nil {
 		return &resourcepb.PutBlobResponse{Error: AsErrorResult(err)}, nil
 	}
