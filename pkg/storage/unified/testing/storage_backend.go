@@ -1181,9 +1181,8 @@ func runTestIntegrationBlobSupport(t *testing.T, backend resource.StorageBackend
 	store, ok := backend.(resource.BlobSupport)
 	require.True(t, ok)
 	ns := nsPrefix + "-ns1"
-	// The blob RPCs gate on user.GetNamespace() matching the request's
-	// namespace, so the test ctx needs an identity scoped to ns rather than
-	// the empty user that NewTestContext provides by default.
+	// Blob RPCs gate on namespace match; the default empty-user ctx from
+	// NewTestContext would 403.
 	ctx := identity.WithServiceIdentityForSingleNamespaceContext(
 		testutil.NewTestContext(t, time.Now().Add(5*time.Second)),
 		ns,
@@ -1197,9 +1196,7 @@ func runTestIntegrationBlobSupport(t *testing.T, backend resource.StorageBackend
 			Name:      "nnn",
 		}
 
-		// PutBlob must reject when the parent resource does not yet exist.
-		// PutBlob is not a staging primitive -- the parent is required so we
-		// have a folder to authorize against and an owner for the blob's UID.
+		// PutBlob must 404 before the parent exists (see blob.proto).
 		preExisting, err := server.PutBlob(ctx, &resourcepb.PutBlobRequest{
 			Resource:    key,
 			Method:      resourcepb.PutBlobRequest_GRPC,
@@ -1208,10 +1205,8 @@ func runTestIntegrationBlobSupport(t *testing.T, backend resource.StorageBackend
 		})
 		require.NoError(t, err)
 		require.NotNil(t, preExisting.Error)
-		require.Equal(t, int32(http.StatusNotFound), preExisting.Error.Code,
-			"PutBlob must 404 when the parent resource does not exist")
+		require.Equal(t, int32(http.StatusNotFound), preExisting.Error.Code)
 
-		// Now create the parent so the subsequent PutBlob calls have a target.
 		initial := &unstructured.Unstructured{}
 		initialMeta, err := utils.MetaAccessor(initial)
 		require.NoError(t, err)
@@ -1254,7 +1249,6 @@ func runTestIntegrationBlobSupport(t *testing.T, backend resource.StorageBackend
 		require.NoError(t, err)
 		require.Contains(t, string(found.Value), "hello 22222")
 
-		// Update the resource to point at b2 in its blob annotation.
 		obj := &unstructured.Unstructured{}
 		meta, err := utils.MetaAccessor(obj)
 		require.NoError(t, err)

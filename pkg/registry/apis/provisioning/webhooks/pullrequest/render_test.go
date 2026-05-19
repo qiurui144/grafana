@@ -295,16 +295,11 @@ func TestScreenshotRenderer_RenderScreenshot(t *testing.T) {
 	}
 }
 
-// TestScreenshotRenderer_PropagatesIdentity locks in the contract that the
-// blob-storage RPC sees the same caller identity the renderer was invoked
-// with. PutBlob on the unified storage resource server now requires a user
-// in ctx and runs access.Check against the parent repository; if a future
-// refactor of this function drops or replaces the ctx between the input
-// boundary and PutBlob, that gate would 401 every PR screenshot in
-// production. The propagation chain is set up two callers up
-// (jobs/driver.go calls identity.WithProvisioningIdentity before invoking
-// any worker), so all this test guarantees is that the renderer doesn't
-// strip what was handed to it.
+// PutBlob on the unified storage server requires a user in ctx; a refactor
+// that drops the ctx between the renderer boundary and PutBlob would 401
+// every PR screenshot in production. Identity is stamped two callers
+// upstream (jobs/driver.go), so this test only verifies the renderer
+// doesn't strip it.
 func TestScreenshotRenderer_PropagatesIdentity(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -325,10 +320,9 @@ func TestScreenshotRenderer_PropagatesIdentity(t *testing.T) {
 	}
 	inCtx := authlib.WithAuthInfo(context.Background(), user)
 
-	// Capture the ctx in the matcher and assert outside the mock callback.
-	// require.* inside MatchedBy calls runtime.Goexit on failure, which kills
-	// the testify-mock goroutine mid-match and deadlocks the test waiting on
-	// a PutBlob that never returns.
+	// Assert outside the mock callback: require.* inside MatchedBy calls
+	// runtime.Goexit on failure and deadlocks the test waiting on a PutBlob
+	// that never returns.
 	var capturedCtx context.Context
 	blobstore := NewMockBlobStoreClient(t)
 	blobstore.On("PutBlob", mock.MatchedBy(func(callCtx context.Context) bool {

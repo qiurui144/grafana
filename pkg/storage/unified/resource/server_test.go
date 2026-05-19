@@ -1834,9 +1834,8 @@ func TestFolderDeletePermissionChecks(t *testing.T) {
 	})
 }
 
-// stubBlobSupport records whether PutResourceBlob was reached. PutBlob tests
-// use it to assert that the defense-in-depth gate either delegates to the blob
-// backend or short-circuits before it.
+// stubBlobSupport records whether PutResourceBlob was reached so tests can
+// assert that the authz gate short-circuits or delegates.
 type stubBlobSupport struct {
 	putReached bool
 }
@@ -1852,9 +1851,8 @@ func (s *stubBlobSupport) GetResourceBlob(_ context.Context, _ *resourcepb.Resou
 	return &resourcepb.GetBlobResponse{}, nil
 }
 
-// errorOnReadResourceBackend wraps a real StorageBackend and forces
-// ReadResource to return a pre-canned ErrorResult, leaving every other
-// method untouched. Tests use it to drive PutBlob's parent-lookup branch.
+// errorOnReadResourceBackend lets tests inject an arbitrary ReadResource
+// error to exercise PutBlob's failure passthrough.
 type errorOnReadResourceBackend struct {
 	StorageBackend
 	readErr *resourcepb.ErrorResult
@@ -1864,10 +1862,9 @@ func (b *errorOnReadResourceBackend) ReadResource(_ context.Context, _ *resource
 	return &BackendReadResponse{Error: b.readErr}
 }
 
-// Stop delegates to the underlying backend so srv.Stop can shut down the
-// real backend's lifecycle goroutines (goleak otherwise flags them).
-// Required because embedding the StorageBackend interface doesn't promote
-// methods that live outside that interface.
+// Embedding the StorageBackend interface doesn't promote Stop; without
+// this override srv.Stop can't reach the real backend's goroutines and
+// goleak flags them.
 func (b *errorOnReadResourceBackend) Stop(ctx context.Context) error {
 	if s, ok := b.StorageBackend.(ResourceServerStopper); ok {
 		return s.Stop(ctx)
@@ -1926,9 +1923,8 @@ func TestPutBlobPermissionChecks(t *testing.T) {
 		return srv
 	}
 
-	// createParentResource seeds the parent so that the ReadResource inside
-	// PutBlob returns successfully. The ACL is flipped to allow during creation,
-	// then the caller is free to switch ac.fn before calling PutBlob.
+	// createParentResource seeds the parent under a permissive ACL so the
+	// caller is free to flip ac.fn before exercising PutBlob.
 	createParentResource := func(t *testing.T, srv *server, ac *callbackAccessClient) {
 		t.Helper()
 		ac.fn = func(_ authlib.CheckRequest, _ string) (authlib.CheckResponse, error) { return allow() }
@@ -1950,15 +1946,10 @@ func TestPutBlobPermissionChecks(t *testing.T) {
 	})
 
 	t.Run("returns 404 when parent resource does not exist", func(t *testing.T) {
-		// PutBlob is not a staging primitive: the proto contract requires the
-		// parent resource to exist before a blob is attached. Without a parent
-		// we have no folder to authorize against and no resource for the blob
-		// UID to live on, so we reject with 404.
 		ac := &callbackAccessClient{fn: func(authlib.CheckRequest, string) (authlib.CheckResponse, error) { return allow() }}
 		blob := &stubBlobSupport{}
 		srv := newServer(t, ac, blob)
 
-		// No createParentResource -- the backend has nothing under key.
 		rsp, err := srv.PutBlob(ctxWithUser, &resourcepb.PutBlobRequest{Resource: key})
 		require.NoError(t, err)
 		require.NotNil(t, rsp.Error)
@@ -2015,20 +2006,16 @@ func TestPutBlobPermissionChecks(t *testing.T) {
 		require.Nil(t, rsp.Error)
 		require.True(t, blob.putReached, "must delegate to blob backend on allow")
 
-		// Authz must be asked about "update" on the parent's group/resource/name.
 		require.Equal(t, utils.VerbUpdate, capturedReq.Verb)
 		require.Equal(t, group, capturedReq.Group)
 		require.Equal(t, resource, capturedReq.Resource)
 		require.Equal(t, namespace, capturedReq.Namespace)
 		require.Equal(t, name, capturedReq.Name)
-		// Test resource has no folder annotation, so the folder passed to Check is empty.
+		// Test value has no folder annotation, so the expected folder is empty.
 		require.Equal(t, "", capturedFolder)
 	})
 
 	t.Run("propagates backend ReadResource error verbatim", func(t *testing.T) {
-		// PutBlob must surface the storage backend's error as-is (e.g. a
-		// transient 5xx) instead of collapsing every failure mode into a
-		// misleading 404.
 		db, err := badger.Open(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = db.Close() })

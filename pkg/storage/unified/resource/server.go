@@ -1890,18 +1890,10 @@ func (s *server) GetStats(ctx context.Context, req *resourcepb.ResourceStatsRequ
 	return s.search.GetStats(ctx, req)
 }
 
-// requireUserNamespace is a minimal, low-cost gate that delegated-only RPCs
-// can call before doing per-tenant work. It returns:
-//
-//   - 401 ErrorResult when the request has no AuthInfo (the caller forgot to
-//     stamp identity in ctx),
-//   - 403 ErrorResult when the user's namespace does not match the requested
-//     namespace and is not the wildcard "*",
-//   - nil when the caller may proceed.
-//
-// This is not a substitute for resource-level access.Check; it only catches
-// the cross-tenant case (a user authenticated for one namespace asking for
-// data in another) which the per-method NOTE warns about.
+// requireUserNamespace is a cross-tenant safety net for delegated-only
+// RPCs. It does not replace resource-level access.Check; it only catches
+// the case where a caller authenticated for one namespace asks for data
+// in another.
 func requireUserNamespace(ctx context.Context, namespace string) *resourcepb.ErrorResult {
 	user, ok := claims.AuthInfoFrom(ctx)
 	if !ok || user == nil {
@@ -1955,8 +1947,6 @@ func (s *server) IsHealthy(ctx context.Context, req *resourcepb.HealthCheckReque
 // PutBlob implements BlobStore.
 // NOTE: Internal RPC -- callers are responsible for authorizing the originating user request.
 // Do not route end-user traffic here directly.
-// PutBlob additionally requires the parent resource to exist and the caller
-// to be authorized to update it.
 func (s *server) PutBlob(ctx context.Context, req *resourcepb.PutBlobRequest) (*resourcepb.PutBlobResponse, error) {
 	if req.Resource == nil {
 		return &resourcepb.PutBlobResponse{Error: &resourcepb.ErrorResult{
@@ -1979,10 +1969,8 @@ func (s *server) PutBlob(ctx context.Context, req *resourcepb.PutBlobRequest) (*
 		}}, nil
 	}
 
-	// Load the parent resource: required so we know the caller has something
-	// real to attach to, and so we can authorize "update" against its folder.
-	// PutBlob is not a staging primitive -- the proto contract requires the
-	// resource to exist before a blob is attached.
+	// Load the parent both to enforce existence (see proto) and to get its
+	// folder for access.Check.
 	parent := s.backend.ReadResource(ctx, &resourcepb.ReadRequest{Key: req.Resource})
 	switch {
 	case parent == nil:
@@ -1991,9 +1979,8 @@ func (s *server) PutBlob(ctx context.Context, req *resourcepb.PutBlobRequest) (*
 			Code:    http.StatusNotFound,
 		}}, nil
 	case parent.Error != nil:
-		// Surface the backend's error verbatim (404 for not-found, 5xx for
-		// backend failures, etc.) instead of collapsing every failure mode
-		// into a misleading 404.
+		// Surface backend status as-is; collapsing to 404 would hide
+		// transient 5xx as "not found".
 		return &resourcepb.PutBlobResponse{Error: parent.Error}, nil
 	}
 
