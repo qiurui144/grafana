@@ -1926,31 +1926,21 @@ func TestPutBlobPermissionChecks(t *testing.T) {
 		require.False(t, blob.putReached, "must not delegate to blob backend without a user")
 	})
 
-	t.Run("staging is allowed when parent resource does not exist (proto contract)", func(t *testing.T) {
-		// PutBlobRequest.Resource's proto comment explicitly states "the name
-		// may not yet exist": callers stage a blob, then create the parent
-		// with an annotation pointing at the blob's UID. In that flow the
-		// caller needs "create" on the (group, resource, namespace), not
-		// "update" on the not-yet-existent name.
-		ac := &callbackAccessClient{}
-		var capturedReq authlib.CheckRequest
-		var capturedFolder string
-		ac.fn = func(req authlib.CheckRequest, folder string) (authlib.CheckResponse, error) {
-			capturedReq, capturedFolder = req, folder
-			return allow()
-		}
+	t.Run("returns 404 when parent resource does not exist", func(t *testing.T) {
+		// PutBlob is not a staging primitive: the proto contract requires the
+		// parent resource to exist before a blob is attached. Without a parent
+		// we have no folder to authorize against and no resource for the blob
+		// UID to live on, so we reject with 404.
+		ac := &callbackAccessClient{fn: func(authlib.CheckRequest, string) (authlib.CheckResponse, error) { return allow() }}
 		blob := &stubBlobSupport{}
 		srv := newServer(t, ac, blob)
 
-		// No createParentResource — the backend has nothing under key.
+		// No createParentResource -- the backend has nothing under key.
 		rsp, err := srv.PutBlob(ctxWithUser, &resourcepb.PutBlobRequest{Resource: key})
 		require.NoError(t, err)
-		require.Nil(t, rsp.Error)
-		require.True(t, blob.putReached, "must delegate to blob backend when staging is allowed")
-
-		require.Equal(t, utils.VerbCreate, capturedReq.Verb, "staging must use create, not update")
-		require.Equal(t, "", capturedReq.Name, "staging must not bind to a specific resource name")
-		require.Equal(t, "", capturedFolder, "no parent, so no folder context")
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, int32(http.StatusNotFound), rsp.Error.Code)
+		require.False(t, blob.putReached, "must not delegate when parent resource is missing")
 	})
 
 	t.Run("rejects with 403 when access.Check denies update on parent", func(t *testing.T) {
