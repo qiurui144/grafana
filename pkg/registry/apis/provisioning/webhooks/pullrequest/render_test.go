@@ -325,14 +325,14 @@ func TestScreenshotRenderer_PropagatesIdentity(t *testing.T) {
 	}
 	inCtx := authlib.WithAuthInfo(context.Background(), user)
 
+	// Capture the ctx in the matcher and assert outside the mock callback.
+	// require.* inside MatchedBy calls runtime.Goexit on failure, which kills
+	// the testify-mock goroutine mid-match and deadlocks the test waiting on
+	// a PutBlob that never returns.
+	var capturedCtx context.Context
 	blobstore := NewMockBlobStoreClient(t)
 	blobstore.On("PutBlob", mock.MatchedBy(func(callCtx context.Context) bool {
-		got, ok := authlib.AuthInfoFrom(callCtx)
-		if !ok || got == nil {
-			t.Fatalf("PutBlob received ctx with no AuthInfo -- identity was dropped by the renderer")
-		}
-		require.Equal(t, "test-ns", got.GetNamespace(), "AuthInfo namespace must survive the renderer")
-		require.Equal(t, user.UserUID, got.GetUID(), "AuthInfo UID must survive the renderer")
+		capturedCtx = callCtx
 		return true
 	}), mock.Anything).Return(&resourcepb.PutBlobResponse{Uid: "blob-uid"}, nil)
 
@@ -342,4 +342,12 @@ func TestScreenshotRenderer_PropagatesIdentity(t *testing.T) {
 		Namespace: "test-ns",
 	}, "test", nil)
 	require.NoError(t, err)
+
+	require.NotNil(t, capturedCtx, "PutBlob was never called")
+	got, ok := authlib.AuthInfoFrom(capturedCtx)
+	require.True(t, ok, "PutBlob received ctx with no AuthInfo -- identity was dropped by the renderer")
+	require.NotNil(t, got)
+	require.Equal(t, "test-ns", got.GetNamespace(), "AuthInfo namespace must survive the renderer")
+	// GetIdentifier returns the raw UID; GetUID is the type-prefixed form.
+	require.Equal(t, user.UserUID, got.GetIdentifier(), "AuthInfo UID must survive the renderer")
 }
