@@ -1984,11 +1984,17 @@ func (s *server) PutBlob(ctx context.Context, req *resourcepb.PutBlobRequest) (*
 	// PutBlob is not a staging primitive -- the proto contract requires the
 	// resource to exist before a blob is attached.
 	parent := s.backend.ReadResource(ctx, &resourcepb.ReadRequest{Key: req.Resource})
-	if parent == nil || parent.Error != nil {
+	switch {
+	case parent == nil:
 		return &resourcepb.PutBlobResponse{Error: &resourcepb.ErrorResult{
 			Message: "parent resource not found",
 			Code:    http.StatusNotFound,
 		}}, nil
+	case parent.Error != nil:
+		// Surface the backend's error verbatim (404 for not-found, 5xx for
+		// backend failures, etc.) instead of collapsing every failure mode
+		// into a misleading 404.
+		return &resourcepb.PutBlobResponse{Error: parent.Error}, nil
 	}
 
 	a, err := s.access.Check(ctx, user, claims.CheckRequest{

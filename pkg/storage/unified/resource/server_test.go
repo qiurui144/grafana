@@ -1852,6 +1852,29 @@ func (s *stubBlobSupport) GetResourceBlob(_ context.Context, _ *resourcepb.Resou
 	return &resourcepb.GetBlobResponse{}, nil
 }
 
+// errorOnReadResourceBackend wraps a real StorageBackend and forces
+// ReadResource to return a pre-canned ErrorResult, leaving every other
+// method untouched. Tests use it to drive PutBlob's parent-lookup branch.
+type errorOnReadResourceBackend struct {
+	StorageBackend
+	readErr *resourcepb.ErrorResult
+}
+
+func (b *errorOnReadResourceBackend) ReadResource(_ context.Context, _ *resourcepb.ReadRequest) *BackendReadResponse {
+	return &BackendReadResponse{Error: b.readErr}
+}
+
+// Stop delegates to the underlying backend so srv.Stop can shut down the
+// real backend's lifecycle goroutines (goleak otherwise flags them).
+// Required because embedding the StorageBackend interface doesn't promote
+// methods that live outside that interface.
+func (b *errorOnReadResourceBackend) Stop(ctx context.Context) error {
+	if s, ok := b.StorageBackend.(ResourceServerStopper); ok {
+		return s.Stop(ctx)
+	}
+	return nil
+}
+
 func TestPutBlobPermissionChecks(t *testing.T) {
 	user := &identity.StaticRequester{
 		Type:      authlib.TypeUser,
@@ -2000,6 +2023,45 @@ func TestPutBlobPermissionChecks(t *testing.T) {
 		require.Equal(t, name, capturedReq.Name)
 		// Test resource has no folder annotation, so the folder passed to Check is empty.
 		require.Equal(t, "", capturedFolder)
+	})
+
+	t.Run("propagates backend ReadResource error verbatim", func(t *testing.T) {
+		// PutBlob must surface the storage backend's error as-is (e.g. a
+		// transient 5xx) instead of collapsing every failure mode into a
+		// misleading 404.
+		db, err := badger.Open(badger.DefaultOptions("").WithInMemory(true).WithLogger(nil))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = db.Close() })
+		kvStore := NewBadgerKV(db)
+		realStore, err := NewKVStorageBackend(KVBackendOptions{KvStore: kvStore})
+		require.NoError(t, err)
+
+		backendErr := &resourcepb.ErrorResult{
+			Code:    http.StatusServiceUnavailable,
+			Message: "storage backend unavailable",
+		}
+		wrappedStore := &errorOnReadResourceBackend{StorageBackend: realStore, readErr: backendErr}
+
+		ac := &callbackAccessClient{fn: func(authlib.CheckRequest, string) (authlib.CheckResponse, error) { return allow() }}
+		blob := &stubBlobSupport{}
+		srv, err := NewResourceServer(ResourceServerOptions{
+			Backend:      wrappedStore,
+			AccessClient: ac,
+			Blob:         BlobConfig{Backend: blob},
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Stop(stopCtx)
+		})
+
+		rsp, err := srv.PutBlob(ctxWithUser, &resourcepb.PutBlobRequest{Resource: key})
+		require.NoError(t, err)
+		require.NotNil(t, rsp.Error)
+		require.Equal(t, backendErr.Code, rsp.Error.Code, "must surface the backend error code, not collapse to 404")
+		require.Equal(t, backendErr.Message, rsp.Error.Message)
+		require.False(t, blob.putReached, "must not delegate to blob backend on read failure")
 	})
 }
 
