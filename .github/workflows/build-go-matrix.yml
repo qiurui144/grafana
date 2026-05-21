@@ -52,6 +52,9 @@ jobs:
           - name: linux/s390x
             goos: linux
             goarch: s390x
+          - name: linux/riscv64
+            goos: linux
+            goarch: riscv64
           - name: linux/armv6
             goos: linux
             goarch: arm
@@ -103,6 +106,9 @@ jobs:
           - name: linux/s390x
             goos: linux
             goarch: s390x
+          - name: linux/riscv64
+            goos: linux
+            goarch: riscv64
           - name: linux/armv6
             goos: linux
             goarch: arm
